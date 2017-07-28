@@ -1,0 +1,566 @@
+/*
+* Tencent is pleased to support the open source community by making Libco available.
+
+* Copyright (C) 2014 THL A29 Limited, a Tencent company. All rights reserved.
+*
+* Licensed under the Apache License, Version 2.0 (the "License"); 
+* you may not use this file except in compliance with the License. 
+* You may obtain a copy of the License at
+*
+*	http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, 
+* software distributed under the License is distributed on an "AS IS" BASIS, 
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+* See the License for the specific language governing permissions and 
+* limitations under the License.
+*/
+
+#include "co_routine.h"
+
+#include <errno.h>
+#include <string.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <stack>
+#include <map>
+#include <vector>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <signal.h>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <rapidjson/document.h> 
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/rapidjson.h>
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
+#include "SHA1.h"
+int s_pkgNum=0;
+
+using namespace std;
+struct stEndPoint
+{
+	char *ip;
+	unsigned short int port;
+};
+
+std::string strSessionId = "";
+
+int s_iFunc = 0;
+static void SetAddr(const char *pszIP,const unsigned short shPort,struct sockaddr_in &addr)
+{
+	bzero(&addr,sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(shPort);
+	int nIP = 0;
+	if( !pszIP || '\0' == *pszIP   
+			|| 0 == strcmp(pszIP,"0") || 0 == strcmp(pszIP,"0.0.0.0") 
+			|| 0 == strcmp(pszIP,"*") 
+	  )
+	{
+		nIP = htonl(INADDR_ANY);
+	}
+	else
+	{
+		nIP = inet_addr(pszIP);
+	}
+	addr.sin_addr.s_addr = nIP;
+
+}
+
+static int iSuccCnt = 0;
+static int iFailCnt = 0;
+static int iTime = 0;
+
+void AddSuccCnt()
+{
+	int now = time(NULL);
+	if (now >iTime)
+	{
+		printf("time %d Succ Cnt %d Fail Cnt %d\n", iTime, iSuccCnt, iFailCnt);
+		iTime = now;
+		iSuccCnt = 0;
+		iFailCnt = 0;
+	}
+	else
+	{
+		iSuccCnt++;
+	}
+}
+void AddFailCnt()
+{
+	int now = time(NULL);
+	if (now >iTime)
+	{
+		printf("time %d Succ Cnt %d Fail Cnt %d\n", iTime, iSuccCnt, iFailCnt);
+		iTime = now;
+		iSuccCnt = 0;
+		iFailCnt = 0;
+	}
+	else
+	{
+		iFailCnt++;
+	}
+}
+
+template<class T>
+std::string ToStr(T value)
+{
+	stringstream oSS;
+	oSS << value ;
+	return oSS.str();
+}
+std::string char2hex( char dec )
+{
+    char dig1 = (dec&0xF0)>>4;
+    char dig2 = (dec&0x0F);
+    if ( 0<= dig1 && dig1<= 9) dig1+=48;    //0,48 in ascii
+    if (10<= dig1 && dig1<=15) dig1+=97-10; //A,65 in ascii
+    if ( 0<= dig2 && dig2<= 9) dig2+=48;
+    if (10<= dig2 && dig2<=15) dig2+=97-10;
+
+    std::string r;
+    r.append( &dig1, 1);
+    r.append( &dig2, 1);
+    return r;
+}
+std::string SHA1(const string& strSource)
+{
+    CSHA1 sha1;
+    sha1.Update((unsigned char*)strSource.data(),strSource.size());
+    sha1.Final();
+    string digst;
+    digst.resize(20);
+    sha1.GetHash((unsigned char *)digst.data());
+    string strRet;
+    for(unsigned int i=0; i<digst.size();i++)
+    {
+        strRet+= char2hex(digst[i]);
+    }
+    return strRet;
+}
+string GetCode(std::map<string,string>& mapParams)
+{
+    if(mapParams.empty())
+    {
+        return "";
+    }
+    //add appsecret
+    std::vector<std::string> vecKeys;
+    for(std::map<string,string>::iterator iter = mapParams.begin();
+        iter != mapParams.end();iter++)
+    {
+        vecKeys.push_back(iter->first);
+    }
+
+    //sort
+    sort(vecKeys.begin(), vecKeys.end());
+    string strSorted;
+
+    for(std::vector<string>::iterator iter = vecKeys.begin();
+        iter != vecKeys.end();iter++)
+    {
+        std::map<string,string>::iterator iterValue = mapParams.find(*iter);
+        if(iterValue != mapParams.end())
+        {
+            string strValue = iterValue->second;
+            strSorted += (*iter) + "=" + strValue + "&";
+        }
+        
+    }
+    strSorted = strSorted.substr(0,strSorted.length()-1);
+    std::cout << "strSorted:" << strSorted << endl;
+    string strCalCode = SHA1(strSorted);
+
+    return strCalCode; 
+}
+
+void GetParamsByFunction(int iFunc,string& strJsonParams,string& strFuncName)
+{
+	//http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.DirectSendLM
+	//http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.CreateLM
+	//http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.GetLM
+	//http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.ModifyLM
+	//http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.QueryUser
+
+	string strAppId 	= "wxcbedf3b4ee3b6458";
+	string strAppSec 	= "db2f3409b971199cff40f29a1e4fa073";
+	uint32_t uiTimeStamp = (uint32_t)time(NULL);
+	string strOpenId = "otnzBjhWHQm-kqVisJgaO2LdgUCc";
+
+
+	std::cout << "test functions :" << endl;
+	std::cout << "1.http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.DirectSendLM" << endl;
+	std::cout << "2.http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.CreateLM" << endl;
+	std::cout << "3.http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.GetLM" << endl;
+	std::cout << "4.http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.ModifyLM" << endl;
+	std::cout << "5.http://test.out.wechat.com/luck_money/lmlogic.LMLogicSvr.QueryUser" << endl;
+
+	std::cout << "now testing : " << iFunc << endl;
+
+	if(iFunc > 5)
+	{
+		return;
+	}
+
+
+    rapidjson::Document doc;
+    doc.SetObject();
+    rapidjson::Document::AllocatorType& allocator = doc.GetAllocator();
+ 
+	std::map<string,string> mapParams;
+	switch(iFunc)
+	{
+		case 1:
+		{
+			strFuncName = "lmlogic.LMLogicSvr.DirectSendLM";
+            mapParams.insert(make_pair("appsecret","db2f3409b971199cff40f29a1e4fa073"));
+			mapParams.insert(make_pair("appid",strAppId));
+			mapParams.insert(make_pair("timestamp","1440368900"));
+			mapParams.insert(make_pair("noncestr","teshjshdsjhdjshdj"));
+			mapParams.insert(make_pair("openid",strOpenId));
+			mapParams.insert(make_pair("amount","204"));
+			mapParams.insert(make_pair("currency","MYR"));
+            mapParams.insert(make_pair("lm_class","1"));
+			mapParams.insert(make_pair("valid_begin","1440368789"));
+            mapParams.insert(make_pair("valid_end","1440418789"));
+            mapParams.insert(make_pair("least_cost","1000"));
+            mapParams.insert(make_pair("lm_class_name","test"));
+			string strCode = GetCode(mapParams);
+            std::cout << "code:" << strCode << endl;
+			//gen json
+		    rapidjson::Value appid(rapidjson::kStringType);
+		    appid.SetString(strAppId.c_str(),strAppId.size());
+		    doc.AddMember("appid",appid,allocator); 
+		    rapidjson::Value timestamp(rapidjson::kStringType);
+		    timestamp.SetString(ToStr(uiTimeStamp).c_str(),ToStr(uiTimeStamp).size());
+		    doc.AddMember("timestamp","1440368900",allocator);
+		    doc.AddMember("noncestr","teshjshdsjhdjshdj",allocator);
+		    rapidjson::Value Calcode(rapidjson::kStringType);
+		    Calcode.SetString(strCode.c_str(),strCode.size());
+		    doc.AddMember("code","7e9dd11373d64bf4f0698f4ce488b7671d406207",allocator);
+		    doc.AddMember("openid","otnzBjhWHQm-kqVisJgaO2LdgUCc",allocator);
+		    doc.AddMember("amount",204,allocator);
+		    doc.AddMember("currency","MYR",allocator);
+		    doc.AddMember("lm_class",1,allocator);
+            doc.AddMember("valid_begin",1440368789,allocator);
+            doc.AddMember("valid_end",1440418789,allocator);
+            doc.AddMember("least_cost",1000,allocator);
+            doc.AddMember("lm_class_name","test",allocator);
+		    break;
+		}
+		case 2:
+		{
+			strFuncName = "lmlogic.LMLogicSvr.CreateLM";
+
+			mapParams.insert(make_pair("appid",strAppId));
+            mapParams.insert(make_pair("couponkey","70248145cb291e72c3b5ddf953d411f9"));
+			mapParams.insert(make_pair("timestamp","1440368789"));
+			mapParams.insert(make_pair("noncestr","teshjshdsjhdjshdj"));
+			mapParams.insert(make_pair("sender_id",strAppId));
+			mapParams.insert(make_pair("sender_type","1"));
+			mapParams.insert(make_pair("lm_type","1"));
+			mapParams.insert(make_pair("lm_msg","OK"));
+			string strCode = GetCode(mapParams);
+			//gen json
+		    rapidjson::Value appid(rapidjson::kStringType);
+		    appid.SetString(strAppId.c_str(),strAppId.size());
+		    doc.AddMember("appid",appid,allocator); 
+		    rapidjson::Value timestamp(rapidjson::kStringType);
+		    timestamp.SetString(ToStr(uiTimeStamp).c_str(),ToStr(uiTimeStamp).size());
+		    doc.AddMember("timestamp","1440368789",allocator);
+		    doc.AddMember("noncestr","teshjshdsjhdjshdj",allocator);
+		    rapidjson::Value code(rapidjson::kStringType);
+		    code.SetString(strCode.c_str(),strCode.size());
+		    doc.AddMember("code",code,allocator);
+		    doc.AddMember("sender_id","wxcbedf3b4ee3b6458",allocator);
+		    doc.AddMember("sender_type",1,allocator);
+		    doc.AddMember("lm_type",1,allocator);
+		    doc.AddMember("lm_msg","OK",allocator);
+			break;
+		}
+		case 3:
+		{
+			strFuncName = "lmlogic.LMLogicSvr.GetLM";
+		    rapidjson::Value sessionValue(rapidjson::kStringType);
+		    sessionValue.SetString(strSessionId.c_str(),strSessionId.size());
+		    doc.AddMember("sessionid",sessionValue,allocator);  
+		    doc.AddMember("timestamp",1440368789,allocator);  
+		    doc.AddMember("send_orderid","2015080052A242F0422AF27E70D19BF8033E09",allocator);
+            doc.AddMember("appid","wxcbedf3b4ee3b6458",allocator);
+		    break;
+		}
+		case 4:
+		{
+			strFuncName = "lmlogic.LMLogicSvr.ModifyLM";
+			mapParams.insert(make_pair("appid",strAppId));
+            mapParams.insert(make_pair("appsecret","db2f3409b971199cff40f29a1e4fa073"));
+			mapParams.insert(make_pair("timestamp","1440368789"));
+			mapParams.insert(make_pair("noncestr","teshjshdsjhdjshdj"));
+			mapParams.insert(make_pair("send_orderid","2015080052A242F0422AF27E70D19BF8033E09"));
+			mapParams.insert(make_pair("total_amount","2000000"));
+			mapParams.insert(make_pair("currency","MYR"));
+			mapParams.insert(make_pair("total_num","200"));
+			mapParams.insert(make_pair("n_lb","0"));
+			mapParams.insert(make_pair("n_ub","150"));
+			mapParams.insert(make_pair("v_lb","200"));
+			mapParams.insert(make_pair("v_ub","250"));
+			mapParams.insert(make_pair("validity_period","20"));
+			string strCode = GetCode(mapParams);
+
+			//gen json
+		    rapidjson::Value appid(rapidjson::kStringType);
+		    appid.SetString(strAppId.c_str(),strAppId.size());
+		    doc.AddMember("appid",appid,allocator); 
+		    rapidjson::Value timestamp(rapidjson::kStringType);
+		    timestamp.SetString(ToStr(uiTimeStamp).c_str(),ToStr(uiTimeStamp).size());
+		    doc.AddMember("timestamp","1440368789",allocator);
+		    doc.AddMember("noncestr","teshjshdsjhdjshdj",allocator);
+		    rapidjson::Value code(rapidjson::kStringType);
+		    code.SetString(strCode.c_str(),strCode.size());
+		    doc.AddMember("code","a3cabcd019713a7b31c7c925669f8a046720e6a8",allocator);
+		    doc.AddMember("send_orderid","2015080052A242F0422AF27E70D19BF8033E09",allocator);
+		    doc.AddMember("total_amount",2000000,allocator);
+		    doc.AddMember("currency","MYR",allocator);
+		    doc.AddMember("total_num",200,allocator);
+		    doc.AddMember("n_lb",0,allocator);
+		    doc.AddMember("n_ub",150,allocator);
+		    doc.AddMember("v_lb",200,allocator);
+		    doc.AddMember("v_ub",250,allocator);
+		    doc.AddMember("validity_period",20,allocator);
+		    break;
+		}
+		case 5:
+			{
+			strFuncName = "lmlogic.LMLogicSvr.QueryUser";
+			mapParams.insert(make_pair("appid",strAppId));
+            mapParams.insert(make_pair("appsecret","db2f3409b971199cff40f29a1e4fa073"));
+			mapParams.insert(make_pair("timestamp","1440368789"));
+			mapParams.insert(make_pair("noncestr","teshjshdsjhdjshdj"));
+			mapParams.insert(make_pair("openid","otnzBjhWHQm-kqVisJgaO2LdgUCc"));
+			string strCode = GetCode(mapParams);
+
+			//gen json
+		    rapidjson::Value appid(rapidjson::kStringType);
+		    appid.SetString(strAppId.c_str(),strAppId.size());
+		    doc.AddMember("appid",appid,allocator); 
+		    rapidjson::Value timestamp(rapidjson::kStringType);
+		    timestamp.SetString(ToStr(uiTimeStamp).c_str(),ToStr(uiTimeStamp).size());
+		    doc.AddMember("timestamp","1440368789",allocator);
+		    doc.AddMember("noncestr","teshjshdsjhdjshdj",allocator);
+		    rapidjson::Value code(rapidjson::kStringType);
+		    code.SetString(strCode.c_str(),strCode.size());
+		    doc.AddMember("code",code,allocator);
+		    doc.AddMember("openid","otnzBjhWHQm-kqVisJgaO2LdgUCc",allocator);
+		    break;
+			}
+		default:
+			break;
+
+	}
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+    strJsonParams = buffer.GetString();
+    //int iContentLen = strJson.length();
+    std::cout << "strJsonParams:" << strJsonParams << endl;
+    return ;
+}
+
+
+
+static void *readwrite_routine( void *arg )
+{
+
+	co_enable_hook_sys();
+
+	stEndPoint *endpoint = (stEndPoint *)arg;
+    std::ostringstream sBuf;
+
+    //
+    string strFuncName ;
+    string strJsonParams ;
+
+    GetParamsByFunction(s_iFunc,strJsonParams,strFuncName);
+    int iContentLen = strlen(strJsonParams.c_str());
+   	sBuf<<"POST /" << strFuncName <<" HTTP/1.1\r\nUser-Agent: curl/7.15.1.(x86_64-suse-linux).libcurl/7.15.1.OpenSSL/0.9.8a.zlib/1.2.3.libidn/0.6.0 Language/zh_CN\r\nHost: 10.6.222.154:80\r\nAccept: */*\r\nContent-Length: " << iContentLen <<"\r\n\r\n" << strJsonParams;
+
+    
+    string Request=sBuf.str();
+    std::cout << "request:" << Request << endl;
+
+	char buf[ 1024 * 16 ];
+	int fd = -1;
+	int ret = 0;
+    int loopcnt=s_pkgNum;
+	while(loopcnt>0)
+	{
+        loopcnt--;
+		if ( fd < 0 )
+		{
+			fd = socket(PF_INET, SOCK_STREAM, 0);
+            struct timeval tv;
+            tv.tv_sec=2;
+            tv.tv_usec=0;
+            setsockopt( fd, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
+			struct sockaddr_in addr;
+			SetAddr(endpoint->ip, endpoint->port, addr);
+			ret = connect(fd,(struct sockaddr*)&addr,sizeof(addr));
+						
+			if ( errno == EALREADY || errno == EINPROGRESS )
+			{       
+				struct pollfd pf = { 0 };
+				pf.fd = fd;
+				pf.events = (POLLOUT|POLLERR|POLLHUP);
+				co_poll( co_get_epoll_ct(),&pf,1,200);
+				//check connect
+				int error = 0;
+				uint32_t socklen = sizeof(error);
+				errno = 0;
+				ret = getsockopt(fd, SOL_SOCKET, SO_ERROR,(void *)&error,  &socklen);
+				if ( ret == -1 ) 
+				{       
+					//printf("getsockopt ERROR ret %d %d:%s\n", ret, errno, strerror(errno));
+					close(fd);
+					fd = -1;
+					AddFailCnt();
+					continue;
+				}       
+				if ( error ) 
+				{       
+					errno = error;
+					//printf("connect ERROR ret %d %d:%s\n", error, errno, strerror(errno));
+					close(fd);
+					fd = -1;
+					AddFailCnt();
+					continue;
+				}       
+			} 
+	  			
+		}
+		
+
+
+        //send loop
+        ret=0;
+        int iHaveSend=0;
+        char *pData=(char *)Request.data();
+
+        while(iHaveSend<Request.size())
+        {
+            ret = write( fd,pData+iHaveSend, Request.size()-iHaveSend);
+            if(ret<=0)
+            {
+				close(fd);
+				fd = -1;
+				AddFailCnt();
+                printf("write failed\n");
+                break;
+            }
+            iHaveSend+=ret;
+        }
+        
+        if(fd<0) continue;
+
+        
+    
+        //read loop
+        int iHaveRead=0;
+        while(1)
+		{
+			ret = read( fd,buf+iHaveRead, sizeof(buf)-iHaveRead );
+
+			if ( ret <= 0 )
+			{
+                if(EINPROGRESS==errno) continue;
+				close(fd);
+				fd = -1;
+                buf[iHaveRead]=0;
+               // printf("read failed,ret=%d,iHaveRead;%d,errno:%d,%s,buf:%s\n",ret,errno,iHaveRead,strerror(errno),buf);
+				AddFailCnt();
+                break;
+			}
+            iHaveRead+=ret;
+            char *p=strstr(buf,"\r\n\r\n");
+            if(p==NULL) continue;            
+            int iHeadSize=p+4-buf;
+            
+            char *q=strcasestr(buf,"Content-length:");
+            if(q==NULL) 
+            {
+    
+				close(fd);
+				fd = -1;
+				AddFailCnt();
+                break;
+            }
+            q += 15;
+            int contentlen = atoll(q);
+            
+            if((iHeadSize+contentlen)<=iHaveRead)
+            {
+				AddSuccCnt();
+
+                buf[iHaveRead]=0;
+           //     printf("%s\n",buf);
+			//	close(fd);
+			//	fd = -1;
+                break;
+            }
+
+		}
+	}
+    if(fd>0) close(fd);
+	return 0;
+}
+
+int main(int argc,char *argv[])
+{
+	stEndPoint endpoint;
+	endpoint.ip = argv[1];
+	endpoint.port = atoi(argv[2]);
+	int cnt = atoi( argv[3] );
+	int proccnt = atoi( argv[4] );
+	s_pkgNum= atoi( argv[5] );
+
+	s_iFunc = atoi(argv[6]);
+	if(argc > 7)
+    {strSessionId = string(argv[7]);}
+	struct sigaction sa;
+	sa.sa_handler = SIG_IGN;
+	sigaction( SIGPIPE, &sa, NULL );
+	
+	for(int k=0;k<proccnt;k++)
+	{
+
+		pid_t pid = fork();
+		if( pid > 0 )
+		{
+			continue;
+		}
+		else if( pid < 0 )
+		{
+			break;
+		}
+		for(int i=0;i<cnt;i++)
+		{
+			stCoRoutine_t *co = 0;
+			co_create( &co,NULL,readwrite_routine, &endpoint);
+			co_resume( co );
+		}
+		co_eventloop( co_get_epoll_ct(),0,0 );
+
+		exit(0);
+	}
+	return 0;
+}
+/*./example_echosvr 127.0.0.1 10000 100 50*/
